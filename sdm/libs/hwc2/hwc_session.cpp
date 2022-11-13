@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
  * Not a Contribution.
  *
  * Copyright 2015 The Android Open Source Project
@@ -169,20 +169,10 @@ int HWCSession::Init() {
 
   StartServices();
 
-  DisplayError error = buffer_allocator_.Init();
-  if (error != kErrorNone) {
-    ALOGE("%s::%s: Buffer allocaor initialization failed. Error = %d",
-          __CLASS__, __FUNCTION__, error);
-    return -EINVAL;
-  }
+  DisplayError error = kErrorNone;
 
   error = CoreInterface::CreateCore(HWCDebugHandler::Get(), &buffer_allocator_,
                                     &buffer_sync_handler_, &socket_handler_, &core_intf_);
-  if (error != kErrorNone) {
-    buffer_allocator_.Deinit();
-    ALOGE("%s::%s: Display core initialization failed. Error = %d", __CLASS__, __FUNCTION__, error);
-    return -EINVAL;
-  }
 
   g_hwc_uevent_.Register(this);
 
@@ -192,7 +182,6 @@ int HWCSession::Init() {
   if (error != kErrorNone) {
     g_hwc_uevent_.Register(nullptr);
     CoreInterface::DestroyCore();
-    buffer_allocator_.Deinit();
     DLOGE("Primary display type not recognized. Error = %d", error);
     return -EINVAL;
   }
@@ -221,7 +210,6 @@ int HWCSession::Init() {
   if (status) {
     g_hwc_uevent_.Register(nullptr);
     CoreInterface::DestroyCore();
-    buffer_allocator_.Deinit();
     return status;
   }
 
@@ -959,7 +947,7 @@ android::status_t HWCSession::notifyCallback(uint32_t command, const android::Pa
       break;
 
     case qService::IQService::SET_IDLE_TIMEOUT:
-      setIdleTimeout(UINT32(input_parcel->readInt32()));
+      SetIdleTimeout(UINT32(input_parcel->readInt32()));
       break;
 
     case qService::IQService::SET_FRAME_DUMP_CONFIG:
@@ -978,7 +966,7 @@ android::status_t HWCSession::notifyCallback(uint32_t command, const android::Pa
         int disp_id = INT(input_parcel->readInt32());
         HWCDisplay::DisplayStatus disp_status =
               static_cast<HWCDisplay::DisplayStatus>(input_parcel->readInt32());
-        status = SetSecondaryDisplayStatus(disp_id, disp_status);
+        status = SetDisplayStatus(disp_id, disp_status);
         output_parcel->writeInt32(status);
       }
       break;
@@ -992,7 +980,7 @@ android::status_t HWCSession::notifyCallback(uint32_t command, const android::Pa
 
     case qService::IQService::TOGGLE_SCREEN_UPDATES: {
         int32_t input = input_parcel->readInt32();
-        status = toggleScreenUpdate(input == 1);
+        status = ToggleScreenUpdate(input == 1);
         output_parcel->writeInt32(status);
       }
       break;
@@ -1064,7 +1052,7 @@ android::status_t HWCSession::notifyCallback(uint32_t command, const android::Pa
 
     case qService::IQService::SET_CAMERA_STATUS: {
         uint32_t camera_status = UINT32(input_parcel->readInt32());
-        status = setCameraLaunchStatus(camera_status);
+        status = SetCameraLaunchStatus(camera_status);
       }
       break;
 
@@ -1109,6 +1097,14 @@ android::status_t HWCSession::notifyCallback(uint32_t command, const android::Pa
 
     case qService::IQService::GET_COMPOSER_STATUS:
       output_parcel->writeInt32(getComposerStatus());
+      break;
+
+    case qService::IQService::SET_STAND_BY_MODE:
+      status = SetStandByMode(input_parcel);
+      break;
+
+    case qService::IQService::GET_PANEL_RESOLUTION:
+      status = GetPanelResolution(input_parcel, output_parcel);
       break;
 
     default:
@@ -1535,7 +1531,7 @@ int HWCSession::GetEventValue(const char *uevent_data, int length, const char *e
 
 void HWCSession::ResetPanel() {
   HWC2::Error status;
-
+  hwc_display_[HWC_DISPLAY_PRIMARY]->SetResetPanel(true);
   DLOGI("Powering off primary");
   status = hwc_display_[HWC_DISPLAY_PRIMARY]->SetPowerMode(HWC2::PowerMode::Off);
   if (status != HWC2::Error::None) {
@@ -1555,6 +1551,7 @@ void HWCSession::ResetPanel() {
   }
 
   reset_panel_ = false;
+  hwc_display_[HWC_DISPLAY_PRIMARY]->SetResetPanel(false);
 }
 
 int HWCSession::HotPlugHandler(bool connected) {
@@ -1695,6 +1692,44 @@ android::status_t HWCSession::GetVisibleDisplayRect(const android::Parcel *input
   output_parcel->writeInt32(visible_rect.top);
   output_parcel->writeInt32(visible_rect.right);
   output_parcel->writeInt32(visible_rect.bottom);
+
+  return android::NO_ERROR;
+}
+
+android::status_t HWCSession::SetStandByMode(const android::Parcel *input_parcel) {
+  SCOPE_LOCK(locker_[HWC_DISPLAY_PRIMARY]);
+
+  bool enable = (input_parcel->readInt32() > 0);
+  bool is_twm = (input_parcel->readInt32() > 0);
+
+  if (!hwc_display_[HWC_DISPLAY_PRIMARY]) {
+    DLOGI("Primary display is not initialized");
+    return -EINVAL;
+  }
+
+  DisplayError error = hwc_display_[HWC_DISPLAY_PRIMARY]->SetStandByMode(enable, is_twm);
+  if (error != kErrorNone) {
+    DLOGE("SetStandByMode failed. Error = %d", error);
+    return -EINVAL;
+  }
+
+  return android::NO_ERROR;
+}
+
+android::status_t HWCSession::GetPanelResolution(const android::Parcel *input_parcel,
+                                                 android::Parcel *output_parcel) {
+  SCOPE_LOCK(locker_[HWC_DISPLAY_PRIMARY]);
+
+  if (!hwc_display_[HWC_DISPLAY_PRIMARY]) {
+    DLOGI("Primary display is not initialized");
+    return -EINVAL;
+  }
+  auto panel_width = 0u;
+  auto panel_height = 0u;
+
+  hwc_display_[HWC_DISPLAY_PRIMARY]->GetPanelResolution(&panel_width, &panel_height);
+  output_parcel->writeInt32(INT32(panel_width));
+  output_parcel->writeInt32(INT32(panel_height));
 
   return android::NO_ERROR;
 }
